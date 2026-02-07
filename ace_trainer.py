@@ -11,6 +11,7 @@ import torchvision.transforms.functional as TF
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data import sampler
+import torch.nn.functional as F
 from ace_util import get_pixel_grid, to_homogeneous
 from ace_loss import ReproLoss, EuclideanLoss, CELoss
 from ace_network import Regressor
@@ -77,6 +78,7 @@ class TrainerACE:
             aug_scale_max=self.options.aug_scale,
             aug_scale_min=1 / self.options.aug_scale,
         )
+        self.use_semantic_labels = self.dataset.semantic_files is not None
 
         _logger.info("Loaded training scan from: {} -- {} images, mean: {:.2f} {:.2f} {:.2f}".format(
             self.options.scene,
@@ -163,7 +165,8 @@ class TrainerACE:
         creating_buffer_time += buffer_end_time - buffer_start_time
         _logger.info(f"Filled training buffer in {buffer_end_time - buffer_start_time:.1f}s.")
 
-        if self.options.feature_clusters > 0:
+        # if self.options.feature_clusters > 0:
+        if self.options.feature_clusters > 0 and not self.use_semantic_labels:
             self.mini_batch_kmeans.fit(self.training_buffer['features'])
             self.training_buffer['feature_labels'] = self.mini_batch_kmeans.labels_.unsqueeze(-1)
         if self.options.spatial_clusters > 0:
@@ -203,7 +206,6 @@ class TrainerACE:
                      f'Creating buffer time: {creating_buffer_time:.1f} seconds. '
                      f'Training time: {training_time:.1f} seconds. '
                      f'Total time: {end_time - self.training_start:.1f} seconds.')
-
 
     def create_training_buffer(self):
         # Disable benchmarking, since we have variable tensor sizes.
@@ -254,6 +256,10 @@ class TrainerACE:
                                           device=self.device),
             'feature_labels': torch.empty(self.options.training_buffer_size, 1, dtype=torch.float32, device=self.device),
             'spatial_labels': torch.empty(self.options.training_buffer_size, 1, dtype=torch.float32, device=self.device),
+            # 'feature_labels': torch.zeros(self.options.training_buffer_size, 1, dtype=torch.float32,
+            #                               device=self.device),
+            # 'spatial_labels': torch.zeros(self.options.training_buffer_size, 1, dtype=torch.float32,
+            #                               device=self.device),
         }
 
         # Features are computed in evaluation mode.
@@ -270,7 +276,8 @@ class TrainerACE:
             while buffer_idx < self.options.training_buffer_size:
                 dataset_passes += 1
                 # image_B1HW.size() == image_mask_B1HW.size() 但是他们的size不确定
-                for image_B1HW, image_mask_B1HW, coord_BHW3, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _ in training_dataloader:
+                # for image_B1HW, image_mask_B1HW, coord_BHW3, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _ in training_dataloader:
+                for image_B1HW, image_mask_B1HW, coord_BHW3, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, semantic_BHW, _ in training_dataloader:
                     # Copy to device.
                     image_B1HW = image_B1HW.to(self.device, non_blocking=True)
                     image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
@@ -278,6 +285,8 @@ class TrainerACE:
                     gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
                     intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
                     intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
+                    if self.use_semantic_labels:
+                        semantic_BHW = semantic_BHW.to(self.device, non_blocking = True)
 
                     # Compute image features.
                     with autocast(enabled=self.options.use_half):
@@ -305,6 +314,9 @@ class TrainerACE:
                     # Create a tensor with the coordinates of every feature vector.
                     coord_B3HW = coord_BHW3.permute(0, 3, 1, 2)
                     coord_B3HW = TF.resize(coord_B3HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
+                    if self.use_semantic_labels:
+                        semantic_B1HW = semantic_BHW.unsqueeze(1).float()
+                        semantic_B1HW = TF.resize(semantic_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
 
                     # Bx3x4 -> Nx3x4 (for each image, repeat pose per feature)
                     gt_pose_inv = gt_pose_inv_B44[:, :3]
@@ -326,6 +338,8 @@ class TrainerACE:
                         'intrinsics': intrinsics,
                         'intrinsics_inv': intrinsics_inv
                     }
+                    if self.use_semantic_labels:
+                        batch_data['feature_labels'] = normalize_shape(semantic_B1HW)
 
                     # Turn image mask into sampling weights (all equal).
                     image_mask_B1HW = image_mask_B1HW.float()
@@ -346,6 +360,23 @@ class TrainerACE:
                     # Select the data to put in the buffer.
                     for k in batch_data:
                         batch_data[k] = batch_data[k][sample_idxs]
+
+                    # def finite_mask_for_batch(batch_data):
+                    #     m = None
+                    #     for k, v in batch_data.items():
+                    #         if not torch.is_tensor(v):
+                    #             continue
+                    #         cur = torch.isfinite(v).all(dim=1) if v.ndim == 2 else torch.isfinite(v).view(v.shape[0],
+                    #                                                                                       -1).all(dim=1)
+                    #         m = cur if m is None else (m & cur)
+                    #     return m
+                    #
+                    # finite_m = finite_mask_for_batch(batch_data)
+                    # if finite_m.sum() == 0:
+                    #     continue
+                    # for k in batch_data:
+                    #     batch_data[k] = batch_data[k][finite_m]
+                    # features_to_select = batch_data['features'].shape[0]
 
                     # Write to training buffer. Start at buffer_idx and end at buffer_offset - 1.
                     buffer_offset = buffer_idx + features_to_select
@@ -494,21 +525,54 @@ class TrainerACE:
         """
         Run one iteration of training, computing the reprojection error and minimising it.
         """
+
+        # def assert_finite(name, x):
+        #     if not torch.isfinite(x).all():
+        #         raise RuntimeError(f"{name} contains NaN/Inf")
+        #
+        # assert_finite("features_bC", features_bC)
+        # assert_finite("target_px_b2", target_px_b2)
+        # assert_finite("target_coord", target_coord)
+        # assert_finite("Ks_b33", Ks_b33)
+        # assert_finite("gt_inv_poses_b34", gt_inv_poses_b34)
+
+
         batch_size = features_bC.shape[0]
         channels = features_bC.shape[1]
 
         # Reshape to a "fake" BCHW shape, since it's faster to run through the network compared to the original shape.
         features_bCHW = features_bC[None, None, ...].view(-1, 16, 32, channels).permute(0, 3, 1, 2)
 
-        cluster_number = self.options.feature_clusters
-        feature_labels_onehot = torch.FloatTensor(cluster_number, feature_labels.size()[0]).zero_().to('cuda')
-        feature_labels_onehot = feature_labels_onehot.scatter_(0, feature_labels.flatten().unsqueeze(0).to(torch.int64), 1).permute(1, 0)
-        feature_labels_onehot = feature_labels_onehot[None, None, ...].view(-1, 16, 32, cluster_number).permute(0, 3, 1, 2)
+        # cluster_number = self.options.feature_clusters
+        # feature_labels_onehot = torch.FloatTensor(cluster_number, feature_labels.size()[0]).zero_().to('cuda')
+        # feature_labels_onehot = feature_labels_onehot.scatter_(0, feature_labels.flatten().unsqueeze(0).to(torch.int64), 1).permute(1, 0)
+        # feature_labels_onehot = feature_labels_onehot[None, None, ...].view(-1, 16, 32, cluster_number).permute(0, 3, 1, 2)
+        #
+        # cluster_number = self.options.spatial_clusters
+        # spatial_labels_onehot = torch.FloatTensor(cluster_number, spatial_labels.size()[0]).zero_().to('cuda')
+        # spatial_labels_onehot = spatial_labels_onehot.scatter_(0, spatial_labels.flatten().unsqueeze(0).to(torch.int64), 1).permute(1, 0)
+        # spatial_labels_onehot = spatial_labels_onehot[None, None, ...].view(-1, 16, 32, cluster_number).permute(0, 3, 1, 2)
 
-        cluster_number = self.options.spatial_clusters
-        spatial_labels_onehot = torch.FloatTensor(cluster_number, spatial_labels.size()[0]).zero_().to('cuda')
-        spatial_labels_onehot = spatial_labels_onehot.scatter_(0, spatial_labels.flatten().unsqueeze(0).to(torch.int64), 1).permute(1, 0)
-        spatial_labels_onehot = spatial_labels_onehot[None, None, ...].view(-1, 16, 32, cluster_number).permute(0, 3, 1, 2)
+        Kf = int(self.options.feature_clusters)
+        Ks = int(self.options.spatial_clusters)
+
+        feature_labels_onehot = None
+        if Kf > 1:
+            feature_labels_onehot = torch.nn.functional.one_hot(
+                feature_labels.view(-1).to(torch.int64).clamp(0, Kf - 1),
+                num_classes=Kf
+            ).to(self.device, torch.float32)
+            feature_labels_onehot = feature_labels_onehot[None, None, ...].view(-1, 16, 32, Kf).permute(0, 3, 1,
+                                                                                                        2).contiguous()
+
+        spatial_labels_onehot = None
+        if Ks > 1:
+            spatial_labels_onehot = torch.nn.functional.one_hot(
+                spatial_labels.view(-1).to(torch.int64).clamp(0, Ks - 1),
+                num_classes=Ks
+            ).to(self.device, torch.float32)
+            spatial_labels_onehot = spatial_labels_onehot[None, None, ...].view(-1, 16, 32, Ks).permute(0, 3, 1,
+                                                                                                        2).contiguous()
 
         with autocast(enabled=self.options.use_half):
             pred_scene_coords, pred_spatial_labels, pred_feature_labels, _ = self.regressor.get_scene_coordinates(features_bCHW, feature_labels_onehot, spatial_labels_onehot)
@@ -517,15 +581,31 @@ class TrainerACE:
         pred_scene_coords_b3HW = pred_scene_coords[:, 0:3, :, :]
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
 
-        pred_spatial_labels = pred_spatial_labels.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
-        pred_spatial_labels = pred_spatial_labels.permute(2, 1, 0)
-        spatial_labels = spatial_labels.permute(1, 0).to(torch.int64)
-        spatial_labels_loss = self.cls_loss(pred_spatial_labels, spatial_labels)
+        # pred_spatial_labels = pred_spatial_labels.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        # pred_spatial_labels = pred_spatial_labels.permute(2, 1, 0)
+        # spatial_labels = spatial_labels.permute(1, 0).to(torch.int64)
+        # spatial_labels_loss = self.cls_loss(pred_spatial_labels, spatial_labels)
+        #
+        # pred_feature_labels = pred_feature_labels.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        # pred_feature_labels = pred_feature_labels.permute(2, 1, 0)
+        # feature_labels = feature_labels.permute(1, 0).to(torch.int64)
+        # feature_labels_loss = self.cls_loss(pred_feature_labels, feature_labels)
 
-        pred_feature_labels = pred_feature_labels.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
-        pred_feature_labels = pred_feature_labels.permute(2, 1, 0)
-        feature_labels = feature_labels.permute(1, 0).to(torch.int64)
-        feature_labels_loss = self.cls_loss(pred_feature_labels, feature_labels)
+        # spatial loss
+        if Ks > 1:
+            spatial_logits = pred_spatial_labels.permute(0, 2, 3, 1).reshape(-1, Ks).float()
+            spatial_tgt = spatial_labels.view(-1).to(torch.int64).clamp(0, Ks - 1)
+            spatial_labels_loss = F.cross_entropy(spatial_logits, spatial_tgt)
+        else:
+            spatial_labels_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        # feature loss
+        if Kf > 1:
+            feature_logits = pred_feature_labels.permute(0, 2, 3, 1).reshape(-1, Kf).float()
+            feature_tgt = feature_labels.view(-1).to(torch.int64).clamp(0, Kf - 1)
+            feature_labels_loss = F.cross_entropy(feature_logits, feature_tgt)
+        else:
+            feature_labels_loss = torch.zeros((), device=self.device, dtype=torch.float32)
 
         pred_scene_conf_b1HW = pred_scene_coords[:, -1, :, :]
         pred_scene_conf_b1 = pred_scene_conf_b1HW.flatten(0, 2).unsqueeze(-1).float()
@@ -568,9 +648,9 @@ class TrainerACE:
         invalid_mask_b1 = (invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1)
         valid_mask_b1 = ~invalid_mask_b1
 
-        # Reprojection error for all valid scene coordinates.
+        # # Reprojection error for all valid scene coordinates.
         valid_reprojection_error_b1 = reprojection_error_b1[valid_mask_b1]
-        # Compute the loss for valid predictions.
+        # # Compute the loss for valid predictions.
         loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, self.iteration)
 
         # Handle the invalid predictions: generate proxy coordinate targets with constant depth assumption.
@@ -586,13 +666,16 @@ class TrainerACE:
         loss_repro = loss_valid + loss_invalid
         loss_repro /= batch_size
 
-        # conf judge
-        loss_euc = self.euclidean_loss.compute(
-            target_coord,
-            pred_scene_coords_b31.squeeze(),
-            None,
-            valid_mask_b1
-        )
+        # conf judge (only when Ks > 1)
+        if Ks > 1:
+            loss_euc = self.euclidean_loss.compute(
+                target_coord,
+                pred_scene_coords_b31.squeeze(),
+                None,
+                valid_mask_b1
+            )
+        else:
+            loss_euc = torch.zeros((), device=self.device, dtype=torch.float32)
 
         loss = loss_euc * self.alpha + loss_repro + spatial_labels_loss * 100 + feature_labels_loss * 100
 

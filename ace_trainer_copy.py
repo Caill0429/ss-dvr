@@ -327,7 +327,8 @@ class TrainerACE:
             while buffer_idx < self.options.training_buffer_size:
                 dataset_passes += 1
                 # image_B1HW.size() == image_mask_B1HW.size() 但是他们的size不确定
-                for image_B1HW, image_mask_B1HW, coord_BHW3, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _ in training_dataloader:
+                # for image_B1HW, image_mask_B1HW, coord_BHW3, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _ in training_dataloader:
+                for image_B1HW, image_mask_B1HW, coord_BHW3, gt_pose_B44, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ in training_dataloader:
                     # Copy to device.
                     image_B1HW = image_B1HW.to(self.device, non_blocking=True)
                     image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)

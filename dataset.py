@@ -101,6 +101,7 @@ class CamLocDataset(Dataset):
         pose_dir = root_dir / 'poses'
         calibration_dir = root_dir / 'calibration'
         depth_dir = root_dir / 'depth'
+        semantic_dir = root_dir / 'semantics'
 
         # Find all images. The assumption is that it only contains image files.
         # PosixPath('datasets/7scenes_chess/train/rgb/seq-01-frame-000000.color.png')
@@ -118,11 +119,19 @@ class CamLocDataset(Dataset):
         else:
             self.depth_files = None
 
+        if os.path.exists(semantic_dir):
+            self.semantic_files = sorted(semantic_dir.iterdir())
+        else:
+            self.semantic_files = None
+
         if len(self.rgb_files) != len(self.pose_files):
             raise RuntimeError('RGB file count does not match pose file count!')
 
         if len(self.rgb_files) != len(self.calibration_files):
             raise RuntimeError('RGB file count does not match calibration file count!')
+
+        if self.semantic_files and len(self.rgb_files) != len(self.semantic_files):
+            raise  RuntimeError('RGB file count does not match semantic file count!')
 
         # Create grid of 2D pixel positions used when generating scene coordinates from depth.
         if self.init and not self.sparse:
@@ -190,6 +199,12 @@ class CamLocDataset(Dataset):
         return depth
 
     @staticmethod
+    def _resize_label(label, image_height):
+        label = TF.to_pil_image(label)
+        label = TF.resize(label, image_height, interpolation=TF.InterpolationMode.NEAREST)
+        return label
+
+    @staticmethod
     def _rotate_image(image, angle, order, mode='constant'):
         # Image is a torch tensor (CxHxW), convert it to numpy as HxWxC.
         image = image.permute(1, 2, 0).numpy()
@@ -236,6 +251,13 @@ class CamLocDataset(Dataset):
 
         return depth.astype(np.float32)
 
+    def _load_semantic(self, idx):
+        label = cv2.imread(str(self.semantic_files[idx]), -1)
+        if self.scene == 'Cambridge':
+            label = cv2.resize(label, (848, 480), interpolation=cv2.INTER_NEAREST)
+
+        return label.astype(np.uint8)
+
     def _get_single_item(self, idx, image_height):
         """
         Return:
@@ -255,6 +277,12 @@ class CamLocDataset(Dataset):
             depth = self._load_depth(idx)
         else:
             depth = np.zeros_like(image)
+
+        # Load semantic labels:
+        if self.semantic_files:
+            semantic = self._load_semantic(idx)
+        else:
+            semantic = None
 
         # Load intrinsics.
         k = np.loadtxt(self.calibration_files[idx])
@@ -283,6 +311,11 @@ class CamLocDataset(Dataset):
         depth = self._resize_image(depth, image_height)
         depth_transform = transforms.ToTensor()
         depth = depth_transform(depth)
+        if semantic is not None:
+            semantic = self._resize_label(semantic, image_height)
+            semantic = torch.from_numpy(np.array(semantic)).long()
+        else:
+            semantic = torch.zeros((image.size[1], image.size[0]), dtype=torch.long)
 
         # Create mask of the same size as the resized image (it's a PIL image at this point).
         image_mask = torch.ones((1, image.size[1], image.size[0]))
@@ -303,6 +336,7 @@ class CamLocDataset(Dataset):
             image = self._rotate_image(image, angle, 1, 'reflect')
             depth = self._rotate_image(depth, angle, 1, 'reflect')
             image_mask = self._rotate_image(image_mask, angle, 1, 'constant')
+            semantic = self._rotate_image(semantic.unsqueeze(0), angle, 0, 'constant').squeeze(0).long()
 
             # Rotate ground truth camera pose as well.
             angle = angle * math.pi / 180.
@@ -344,16 +378,31 @@ class CamLocDataset(Dataset):
         # Also need the inverse.
         intrinsics_inv = intrinsics.inverse()
 
-        # calculate coord
-        depth = depth.detach().numpy()[0]
-        pose[0:3, 3] = pose[0:3, 3] * 1000.
-        coord, mask = get_coord(depth, pose, intrinsics_inv)
-        coord, mask = to_tensor(coord, mask)
-        pose[0:3, 3] = pose[0:3, 3] / 1000.
+        # # calculate coord
+        # depth = depth.detach().numpy()[0]
+        # pose[0:3, 3] = pose[0:3, 3] * 1000.
+        # coord, mask = get_coord(depth, pose, intrinsics_inv)
+        # coord, mask = to_tensor(coord, mask)
+        # pose[0:3, 3] = pose[0:3, 3] / 1000.
+        #
+        # image_mask = image_mask * mask
 
-        image_mask = image_mask * mask
+        if self.depth_files:
+            depth_np = depth.detach().numpy()[0]
+            pose[0:3, 3] *= 1000.
+            coord, mask = get_coord(depth_np, pose, intrinsics_inv)
+            coord, mask = to_tensor(coord, mask)
+            pose[0:3, 3] /= 1000.
+            image_mask = image_mask * mask
+        else:
+            # 没有 depth：不要生成 coord（否则全无效）
+            coord = torch.zeros((image.shape[1], image.shape[2], 3), dtype=torch.float32)
+            # mask 你可以选择全1（让训练继续）或全0（让训练跳过）
+            # 更安全：全0，让训练端跳过/不采样
+            image_mask = torch.ones_like(image_mask, dtype=torch.bool)
 
-        return image, image_mask, coord, pose, pose_inv, intrinsics, intrinsics_inv, str(self.rgb_files[idx])
+        # return image, image_mask, coord, pose, pose_inv, intrinsics, intrinsics_inv, str(self.rgb_files[idx])
+        return image, image_mask, coord, pose, pose_inv, intrinsics, intrinsics_inv, semantic, str(self.rgb_files[idx])
 
     def __len__(self):
         return len(self.valid_file_indices)

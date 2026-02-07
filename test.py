@@ -17,7 +17,6 @@ import torch
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
-import dsacstar
 from ace_network import Regressor
 from dataset import CamLocDataset
 
@@ -104,11 +103,18 @@ if __name__ == '__main__':
     parser.add_argument('--feature_clusters', type=int, default=2)
 
     parser.add_argument('--conf_threshold', type=str, default=0.51)
+    parser.add_argument('--skip_labels', type=str, default='',
+                        help = 'comma-separated label ids to exclude from PnP (e.g. "0,1,2")')
+
 
     opt = parser.parse_args()
 
     device = torch.device("cuda")
     num_workers = 6
+    if opt.skip_labels:
+        skip_labels = {int(v) for v in opt.skip_labels.split(',') if v.strip() != ''}
+    else:
+        skip_labels = set()
 
     scene_path = Path(opt.scene)
     head_network_path = Path(opt.network)
@@ -202,7 +208,8 @@ if __name__ == '__main__':
     testing_start_time = time.time()
     count = 0
     with torch.no_grad():
-        for image_B1HW, image_mask_B1HW, coord, gt_pose_B44, _, intrinsics_B33, _, filenames in testset_loader:
+        # for image_B1HW, image_mask_B1HW, coord, gt_pose_B44, _, intrinsics_B33, _, filenames in testset_loader:
+        for image_B1HW, image_mask_B1HW, coord, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
             batch_start_time = time.time()
             batch_size = image_B1HW.shape[0]
 
@@ -210,26 +217,52 @@ if __name__ == '__main__':
 
             # Predict scene coordinates.
             with autocast(enabled=True):
-                scene_coordinates_B4HW, _, _, clusters_int, _ = network(image_B1HW)
+                scene_coordinates_B4HW, _, _, clusters_int= network(image_B1HW)
 
-            img = clusters_int[0][0].cpu().detach().numpy()
-            img = img / img.max()
-            img_name = str(filenames[0]).split('/')[-1]
-            img_scene = str(opt.scene).split('/')[-1]
-            img_dir = os.path.join('clusters', img_scene)
-            img_name = os.path.join(img_dir, img_name)
+            # img = clusters_int[0][0].cpu().detach().numpy()
+            # img = img / img.max()
+            # img_name = str(filenames[0]).split('/')[-1]
+            # img_scene = str(opt.scene).split('/')[-1]
+            # img_dir = os.path.join('clusters', img_scene)
+            # img_name = os.path.join(img_dir, img_name)
 
-            if not os.path.exists(img_dir):
-                os.makedirs(img_dir)
-            plt.imsave(img_name, img)
+            # if not os.path.exists(img_dir):
+            #     os.makedirs(img_dir)
+            # plt.imsave(img_name, img)
 
             scene_coordinates_B3HW = scene_coordinates_B4HW[:, 0:3, :, :]
             scene_coordinates_HW = scene_coordinates_B4HW[0, 3, :, :]
+
             threshold = torch.quantile(scene_coordinates_HW, float(opt.conf_threshold))
             conf_mask = (scene_coordinates_HW > threshold).flatten().cpu().detach().numpy()
+            # 如果点太少，回退到全点
+            num = conf_mask.sum()
+
+            if skip_labels:
+                cluster_labels = clusters_int[0][0].cpu().detach().numpy().astype(int)
+                exclude_mask = np.isin(cluster_labels, list(skip_labels))
+                conf_mask &= (~exclude_mask).flatten()
+
+            if num < 1000:
+                conf_mask = np.ones_like(conf_mask, dtype=bool)
 
             conf_numpy = scene_coordinates_HW.cpu().detach().numpy()
             conf_numpy = (conf_numpy - conf_numpy.min()) / (conf_numpy.max() - conf_numpy.min())
+
+            conf_numpy = conf_numpy.astype("float32", copy=False)
+
+            # 去掉 NaN/Inf
+            conf_numpy = np.nan_to_num(conf_numpy, nan=0.0, posinf=0.0, neginf=0.0)
+
+            cmin = float(conf_numpy.min())
+            cmax = float(conf_numpy.max())
+            den = cmax - cmin
+
+            if den < 1e-12:
+                # 置信度全一样：直接置零或置一都行，但一定别 NaN
+                conf_numpy[:] = 0.0
+            else:
+                conf_numpy = (conf_numpy - cmin) / den
 
             B, _, H, W = scene_coordinates_B3HW.size()
             coord = coord[0, 4::8, 4::8, :].cpu()
@@ -257,12 +290,24 @@ if __name__ == '__main__':
             param1_pnp = param1[conf_mask, :]
             param2_pnp = param2[conf_mask, :]
             param3_pnp = param3[conf_mask, :]
+            valid_mask = np.isfinite(param1_pnp).all(axis=1) & np.isfinite(param2_pnp).all(axis=1)
+            param1_pnp = param1_pnp[valid_mask]
+            param2_pnp = param2_pnp[valid_mask]
+            param3_pnp = param3_pnp[valid_mask]
+
+            if param1_pnp.shape[0] < 10:
+                _logger.warning(f"{str(filenames)} insufficient valid PnP points: {param1_pnp.shape[0]}")
+                continue
 
             intrinsics_color = intrinsics_B33[0]
             pose_solver = pnpransac(intrinsics_color[0, 0], intrinsics_color[1, 1],
                                     intrinsics_color[0, 2], intrinsics_color[1, 2])
 
+
+
+            t0 = time.time()
             rot, transl = pose_solver.RANSAC_loop(param1_pnp, param2_pnp, 256)
+            _logger.info(f"{str(filenames)} RANSAC took {time.time() - t0:.3f}s, points={param1_pnp.shape[0]}")
 
             mask = (image_mask_B1HW == 1)
             mask = mask[0, 0, 4::8, 4::8].flatten()
