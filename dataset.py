@@ -41,6 +41,9 @@ class CamLocDataset(Dataset):
             aug_color=0.3,
             image_height=480,
             use_half=True,
+            return_depth=False,
+            return_idx=False,
+            use_depth_for_coord=True,
     ):
         """Constructor.
 
@@ -75,6 +78,9 @@ class CamLocDataset(Dataset):
             self.scene = 'Cambridge'
 
         self.use_half = use_half
+        self.return_depth = return_depth
+        self.return_idx = return_idx
+        self.use_depth_for_coord = use_depth_for_coord
 
         self.init = (mode == 1)
         self.sparse = sparse
@@ -387,7 +393,7 @@ class CamLocDataset(Dataset):
         #
         # image_mask = image_mask * mask
 
-        if self.depth_files:
+        if self.depth_files and self.use_depth_for_coord:
             depth_np = depth.detach().numpy()[0]
             pose[0:3, 3] *= 1000.
             coord, mask = get_coord(depth_np, pose, intrinsics_inv)
@@ -401,8 +407,12 @@ class CamLocDataset(Dataset):
             # 更安全：全0，让训练端跳过/不采样
             image_mask = torch.ones_like(image_mask, dtype=torch.bool)
 
-        # return image, image_mask, coord, pose, pose_inv, intrinsics, intrinsics_inv, str(self.rgb_files[idx])
-        return image, image_mask, coord, pose, pose_inv, intrinsics, intrinsics_inv, semantic, str(self.rgb_files[idx])
+        output = [image, image_mask, coord, pose, pose_inv, intrinsics, intrinsics_inv, semantic, str(self.rgb_files[idx])]
+        if self.return_depth:
+            output.append(depth)
+        if self.return_idx:
+            output.append(idx)
+        return tuple(output)
 
     def __len__(self):
         return len(self.valid_file_indices)
