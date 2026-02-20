@@ -39,11 +39,11 @@ class TrainerACE:
 
         self.device = torch.device('cuda')
 
-        # The flag below controls whether to allow TF32 on matmul. This flag defaults to True.
-        # torch.backends.cuda.matmul.allow_tf32 = False
-
-        # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
-        # torch.backends.cudnn.allow_tf32 = False
+        if hasattr(self.options, 'allow_tf32'):
+            torch.backends.cuda.matmul.allow_tf32 = bool(self.options.allow_tf32)
+            torch.backends.cudnn.allow_tf32 = bool(self.options.allow_tf32)
+        if hasattr(self.options, 'matmul_precision'):
+            torch.set_float32_matmul_precision(self.options.matmul_precision)
 
         # Setup randomness for reproducibility.
         self.base_seed = 2089
@@ -67,7 +67,9 @@ class TrainerACE:
 
         self.iteration = 0
         self.training_start = None
-        self.num_data_loader_workers = 12
+        self.num_data_loader_workers = max(0, int(getattr(self.options, 'num_workers', 12)))
+        self.loader_pin_memory = bool(getattr(self.options, 'loader_pin_memory', True))
+        self.loader_prefetch_factor = max(1, int(getattr(self.options, 'loader_prefetch_factor', 2)))
 
         # Create dataset.
         self.dataset = CamLocDataset(
@@ -286,17 +288,20 @@ class TrainerACE:
 
         # Batching is handled at the dataset level (the dataset __getitem__ receives a list of indices, because we
         # need to rescale all images in the batch to the same size).
-        training_dataloader = DataLoader(
-            dataset=self.dataset,
-            sampler=batch_sampler,
-            batch_size=None,
-            worker_init_fn=seed_worker,
-            generator=self.loader_generator,
-            pin_memory=True,
-            num_workers=self.num_data_loader_workers,
-            persistent_workers=self.num_data_loader_workers > 0,
-            # timeout=60 if self.num_data_loader_workers > 0 else 0,
-        )
+        loader_kwargs = {
+            'dataset': self.dataset,
+            'sampler': batch_sampler,
+            'batch_size': None,
+            'worker_init_fn': seed_worker,
+            'generator': self.loader_generator,
+            'pin_memory': self.loader_pin_memory,
+            'num_workers': self.num_data_loader_workers,
+            'persistent_workers': self.num_data_loader_workers > 0,
+        }
+        if self.num_data_loader_workers > 0:
+            loader_kwargs['prefetch_factor'] = self.loader_prefetch_factor
+
+        training_dataloader = DataLoader(**loader_kwargs)
 
         _logger.info("Starting creation of the training buffer.")
 

@@ -237,7 +237,16 @@ if __name__ == '__main__':
                         help='lower lr bound for cyclic schedulers that hit 0')
 
     # others
-    parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--num_workers', default=8, type=int,
+                        help='number of dataloader workers used to build the training buffer')
+    parser.add_argument('--loader_prefetch_factor', default=4, type=int,
+                        help='prefetch batches per dataloader worker')
+    parser.add_argument('--loader_pin_memory', type=_strtobool, default=True,
+                        help='enable pinned host memory for faster CPU->GPU transfer')
+    parser.add_argument('--allow_tf32', type=_strtobool, default=True,
+                        help='allow TF32 on Ampere+ GPUs for faster matmul/cuDNN')
+    parser.add_argument('--matmul_precision', type=str, default='high', choices=['highest', 'high', 'medium'],
+                        help='torch float32 matmul precision mode')
 
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
 
