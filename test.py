@@ -106,7 +106,6 @@ if __name__ == '__main__':
     parser.add_argument('--skip_labels', type=str, default='',
                         help = 'comma-separated label ids to exclude from PnP (e.g. "0,1,2")')
 
-
     opt = parser.parse_args()
 
     device = torch.device("cuda")
