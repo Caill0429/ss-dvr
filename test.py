@@ -105,25 +105,11 @@ if __name__ == '__main__':
     parser.add_argument('--conf_threshold', type=str, default=0.51)
     parser.add_argument('--skip_labels', type=str, default='',
                         help = 'comma-separated label ids to exclude from PnP (e.g. "0,1,2")')
-    parser.add_argument('--num_workers', type=int, default=6,
-                        help='number of dataloader workers for evaluation')
-    parser.add_argument('--prefetch_factor', type=int, default=4,
-                        help='prefetch batches per dataloader worker')
-    parser.add_argument('--pin_memory', type=_strtobool, default=True,
-                        help='enable pinned host memory in test dataloaders')
-    parser.add_argument('--allow_tf32', type=_strtobool, default=True,
-                        help='allow TF32 on Ampere+ GPUs during inference')
-    parser.add_argument('--matmul_precision', type=str, default='high', choices=['highest', 'high', 'medium'],
-                        help='torch float32 matmul precision mode')
 
     opt = parser.parse_args()
 
     device = torch.device("cuda")
-    num_workers = max(0, int(opt.num_workers))
-    torch.backends.cuda.matmul.allow_tf32 = bool(opt.allow_tf32)
-    torch.backends.cudnn.allow_tf32 = bool(opt.allow_tf32)
-    torch.set_float32_matmul_precision(opt.matmul_precision)
-    torch.backends.cudnn.benchmark = True
+    num_workers = 6
     if opt.skip_labels:
         skip_labels = {int(v) for v in opt.skip_labels.split(',') if v.strip() != ''}
     else:
@@ -143,15 +129,7 @@ if __name__ == '__main__':
     _logger.info(f'Test images found: {len(testset)}')
 
     # Setup dataloader. Batch size 1 by default.
-    test_loader_kwargs = dict(
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=opt.pin_memory,
-        persistent_workers=num_workers > 0,
-    )
-    if num_workers > 0:
-        test_loader_kwargs['prefetch_factor'] = max(1, int(opt.prefetch_factor))
-    testset_loader = DataLoader(testset, **test_loader_kwargs)
+    testset_loader = DataLoader(testset, shuffle=False, num_workers=6)
 
     # Load network weights.
     encoder_state_dict = torch.load(encoder_path, map_location="cpu")
@@ -214,7 +192,7 @@ if __name__ == '__main__':
         )
 
         # Setup dataloader. Batch size 1 by default.
-        trainset_loader = DataLoader(trainset, **test_loader_kwargs)
+        trainset_loader = DataLoader(trainset, shuffle=False, num_workers=6)
 
         ace_visualizer.setup_reloc_visualisation(
             frame_count=len(testset),
