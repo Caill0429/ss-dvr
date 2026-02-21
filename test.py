@@ -100,7 +100,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--spatial_clusters', type=int, default=64)
 
-    parser.add_argument('--feature_clusters', type=int, default=2)
+    parser.add_argument('--feature_clusters', type=int, default=64)
 
     parser.add_argument('--conf_threshold', type=str, default=0.51)
     parser.add_argument('--skip_labels', type=str, default='',

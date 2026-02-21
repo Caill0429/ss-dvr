@@ -5,28 +5,3 @@ clusters
 output
 njy.py
 pnpransac
-
-# Python
-__pycache__/
-*.pyc
-
-# PyCharm
-.idea/
-
-# datasets
-datasets/
-
-# checkpoints / models
-*.pt
-*.pth
-*.ckpt
-
-# zip files
-*.zip
-
-# backups
-backup_20260221/
-
-# env
-.env
-venv/
