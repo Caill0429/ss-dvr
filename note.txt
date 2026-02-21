@@ -1,0 +1,4 @@
+项目目录：/home/vrlab/project/ss-dvr
+数据集：/home/vrlab/project/ss-dvr/data
+数据集：
+    7scenes
